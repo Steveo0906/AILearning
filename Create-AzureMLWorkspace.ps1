@@ -1,93 +1,150 @@
 <#
 .SYNOPSIS
-    Creates an Azure Machine Learning workspace and dependencies.
+    Creates an Azure Machine Learning Workspace with supporting resources.
+    Fully idempotent, handles soft-deleted Key Vaults, and reuses or creates
+    required dependencies.
 
 .DESCRIPTION
-    Automates the provisioning of an Azure ML Workspace with a Storage Account,
-    Key Vault, and Application Insights. Includes version validation and
-    breaking-change warning suppression.
-
-.NOTES
-    Author: Steven
-    Date:   2025-10-07
+    This script:
+    - Connects to Azure.
+    - Creates or reuses a resource group.
+    - Creates Storage Account, Key Vault, and Application Insights.
+    - Handles soft-deleted Key Vaults (purge + wait + recreate).
+    - Creates or reuses an Azure Machine Learning Workspace.
 #>
 
-param(
-    [Parameter(Mandatory = $true)] [string]$SubscriptionId,
-    [Parameter(Mandatory = $true)] [string]$ResourceGroupName,
-    [Parameter(Mandatory = $true)] [string]$WorkspaceName,
-    [Parameter(Mandatory = $false)] [string]$Region = "EastUS"
-)
+# ========================
+# === CONFIGURATION ===
+# ========================
+$SubscriptionId     = "<YOUR_SUBSCRIPTION_ID>"
+$ResourceGroupName  = "<YOUR_RESOURCE_GROUP>"
+$WorkspaceName      = "<YOUR_WORKSPACE_NAME>"
+$Region             = "EastUS"
 
-# --- Safety and Compatibility Checks ---
-$env:SuppressAzurePowerShellBreakingChangeWarnings = "true"
-Write-Host "🔧 Azure PowerShell breaking-change warnings suppressed." -ForegroundColor DarkGray
+# Derived resource names (adjust as desired)
+$storageAccountName = ("st" + ($WorkspaceName.Replace("-", "").Substring(0, [Math]::Min(20, $WorkspaceName.Length)))).ToLower()
+$keyVaultName       = ("kv-" + $WorkspaceName).ToLower()
+$appInsightsName    = ("appi-" + $WorkspaceName).ToLower()
 
-$azModule = Get-Module -ListAvailable Az | Sort-Object Version -Descending | Select-Object -First 1
-if ($azModule.Version -lt [version]"11.0.0") {
-    Write-Host "⚠️  Your Az module version ($($azModule.Version)) is below 11.0.0. Consider updating for long-term compatibility." -ForegroundColor Yellow
-} else {
-    Write-Host "✅ Az module version check passed: $($azModule.Version)" -ForegroundColor Green
-}
-
-# --- Connect and Set Context ---
+# ========================
+# === AUTHENTICATION ===
+# ========================
 Write-Host "Connecting to Azure..." -ForegroundColor Cyan
-Connect-AzAccount | Out-Null
-Set-AzContext -SubscriptionId $SubscriptionId
+Connect-AzAccount -Subscription $SubscriptionId | Out-Null
+Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 
-# --- Create Resource Group ---
+# ========================
+# === RESOURCE GROUP ===
+# ========================
 if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue)) {
-    Write-Host "Creating Resource Group: $ResourceGroupName ($Region)" -ForegroundColor Yellow
+    Write-Host "`nCreating Resource Group: $ResourceGroupName" -ForegroundColor Yellow
     New-AzResourceGroup -Name $ResourceGroupName -Location $Region | Out-Null
 } else {
-    Write-Host "Resource Group exists: $ResourceGroupName" -ForegroundColor Green
+    Write-Host "`nUsing existing Resource Group: $ResourceGroupName" -ForegroundColor Green
 }
 
-# --- Resource Naming ---
-$storageName = ($WorkspaceName.ToLower() + "stor") -replace "[^a-z0-9]", ""
-$storageName = $storageName.Substring(0, [Math]::Min(24, $storageName.Length))
-$keyVaultName = ($WorkspaceName.ToLower() + "-kv") -replace "[^a-z0-9-]", ""
-$appInsightsName = ($WorkspaceName.ToLower() + "-ai") -replace "[^a-z0-9-]", ""
-
-# --- Storage Account ---
-if (-not (Get-AzStorageAccount -Name $storageName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue)) {
-    Write-Host "Creating Storage Account: $storageName" -ForegroundColor Yellow
-    $storage = New-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $storageName -Location $Region -SkuName Standard_LRS -Kind StorageV2
+# ========================
+# === STORAGE ACCOUNT ===
+# ========================
+if (-not (Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $storageAccountName -ErrorAction SilentlyContinue)) {
+    Write-Host "`nCreating Storage Account: $storageAccountName" -ForegroundColor Yellow
+    New-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $storageAccountName `
+        -Location $Region -SkuName "Standard_LRS" -Kind "StorageV2" | Out-Null
 } else {
-    Write-Host "Using existing Storage Account: $storageName" -ForegroundColor Green
-    $storage = Get-AzStorageAccount -Name $storageName -ResourceGroupName $ResourceGroupName
+    Write-Host "`nUsing existing Storage Account: $storageAccountName" -ForegroundColor Green
 }
 
-# --- Key Vault ---
-if (-not (Get-AzKeyVault -VaultName $keyVaultName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue)) {
+# ========================
+# === APPLICATION INSIGHTS ===
+# ========================
+if (-not (Get-AzApplicationInsights -ResourceGroupName $ResourceGroupName -Name $appInsightsName -ErrorAction SilentlyContinue)) {
+    Write-Host "`nCreating Application Insights: $appInsightsName" -ForegroundColor Yellow
+    New-AzApplicationInsights -ResourceGroupName $ResourceGroupName -Name $appInsightsName `
+        -Location $Region -Kind web -ApplicationType web | Out-Null
+} else {
+    Write-Host "`nUsing existing Application Insights: $appInsightsName" -ForegroundColor Green
+}
+
+# ========================
+# === KEY VAULT ===
+# ========================
+Write-Host "`n--- Checking Key Vault State ---" -ForegroundColor Cyan
+
+# Check for a soft-deleted Key Vault
+$deletedVault = Get-AzKeyVault -VaultName $keyVaultName -InRemovedState -Location $Region -ErrorAction SilentlyContinue
+
+if ($deletedVault) {
+    Write-Host "Soft-deleted Key Vault found: $keyVaultName — purging now..." -ForegroundColor Yellow
+    Remove-AzKeyVault -VaultName $keyVaultName -Location $Region -InRemovedState -Force
+    Write-Host "Purge initiated. Waiting for Azure to release the vault name..." -ForegroundColor DarkYellow
+}
+
+# Function: Wait until a Key Vault name becomes available
+function Wait-ForKeyVaultAvailability {
+    param (
+        [string]$VaultName,
+        [string]$Region,
+        [int]$MaxAttempts = 12,
+        [int]$DelaySeconds = 10
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $existsActive  = Get-AzKeyVault -VaultName $VaultName -Location $Region -ErrorAction SilentlyContinue
+        $existsDeleted = Get-AzKeyVault -VaultName $VaultName -InRemovedState -Location $Region -ErrorAction SilentlyContinue
+
+        if (-not $existsActive -and -not $existsDeleted) {
+            Write-Host "Vault name $VaultName is now available (after $attempt attempt(s))." -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "[$attempt/$MaxAttempts] Vault name still in use or soft-deleted... waiting $DelaySeconds seconds..." -ForegroundColor DarkGray
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+
+    Write-Host "[ERROR] Vault name $VaultName is still locked after $($MaxAttempts * $DelaySeconds) seconds." -ForegroundColor Red
+    return $false
+}
+
+# Wait until the vault name becomes available after purge
+if (-not (Wait-ForKeyVaultAvailability -VaultName $keyVaultName -Region $Region)) {
+    throw "Key Vault name $keyVaultName is still unavailable. Aborting deployment."
+}
+
+# Create or reuse the Key Vault
+$existingVault = Get-AzKeyVault -VaultName $keyVaultName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+
+if (-not $existingVault) {
     Write-Host "Creating Key Vault: $keyVaultName" -ForegroundColor Yellow
-    $keyVault = New-AzKeyVault -Name $keyVaultName -ResourceGroupName $ResourceGroupName -Location $Region
+    try {
+        $keyVault = New-AzKeyVault -Name $keyVaultName -ResourceGroupName $ResourceGroupName -Location $Region -ErrorAction Stop
+        Write-Host "Key Vault created successfully." -ForegroundColor Green
+    } catch {
+        Write-Host "[ERROR] Failed to create Key Vault: $($_.Exception.Message)" -ForegroundColor Red
+        throw
+    }
 } else {
     Write-Host "Using existing Key Vault: $keyVaultName" -ForegroundColor Green
-    $keyVault = Get-AzKeyVault -VaultName $keyVaultName -ResourceGroupName $ResourceGroupName
+    $keyVault = $existingVault
 }
 
-# --- Application Insights ---
-if (-not (Get-AzApplicationInsights -Name $appInsightsName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue)) {
-    Write-Host "Creating Application Insights: $appInsightsName" -ForegroundColor Yellow
-    $appInsights = New-AzApplicationInsights -ResourceGroupName $ResourceGroupName -Name $appInsightsName -Location $Region -ApplicationType web
-} else {
-    Write-Host "Using existing Application Insights: $appInsightsName" -ForegroundColor Green
-    $appInsights = Get-AzApplicationInsights -Name $appInsightsName -ResourceGroupName $ResourceGroupName
-}
+# ========================
+# === MACHINE LEARNING WORKSPACE ===
+# ========================
+Write-Host "`nChecking for existing Azure Machine Learning Workspace..." -ForegroundColor Cyan
 
-# --- ML Workspace ---
-if (-not (Get-AzMLWorkspace -Name $WorkspaceName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue)) {
-    Write-Host "Creating Machine Learning Workspace: $WorkspaceName" -ForegroundColor Yellow
+$workspace = Get-AzMLWorkspace -Name $WorkspaceName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+
+if (-not $workspace) {
+    Write-Host "Creating Azure Machine Learning Workspace: $WorkspaceName" -ForegroundColor Yellow
     New-AzMLWorkspace -Name $WorkspaceName `
         -ResourceGroupName $ResourceGroupName `
         -Location $Region `
-        -StorageAccountName $storage.StorageAccountName `
-        -KeyVaultName $keyVault.VaultName `
-        -ApplicationInsightsName $appInsights.Name `
-        -ContainerRegistryName ""
+        -KeyVault $keyVaultName `
+        -ApplicationInsights $appInsightsName `
+        -Sku Basic | Out-Null
+    Write-Host "Azure ML Workspace created successfully." -ForegroundColor Green
 } else {
-    Write-Host "Workspace already exists: $WorkspaceName" -ForegroundColor Green
+    Write-Host "Using existing Azure ML Workspace: $WorkspaceName" -ForegroundColor Green
 }
 
-Write-Host "`n✅ Azure Machine Learning Workspace setup complete." -ForegroundColor Cyan
+Write-Host "`nDeployment complete. All resources are ready." -ForegroundColor Cyan
